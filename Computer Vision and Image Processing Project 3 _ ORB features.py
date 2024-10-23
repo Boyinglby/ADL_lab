@@ -1,18 +1,13 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[4]:
-
-
 import os
 import cv2
 import numpy as np
-import open3d as o3d
-from PIL import Image
-import pyheif
 import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.cluster import KMeans
+from PIL import Image
+import pyheif
 
 # 1. Convert HEIC to PNG
 def convert_heic_to_png(heic_folder, output_folder):
@@ -40,7 +35,7 @@ def convert_heic_to_png(heic_folder, output_folder):
                 print(f"Error converting {file_name}: {e}")
 
 # 2. Get Dataset Image and PCD Paths
-def get_dataset_paths(raw_folder, image_folders, pcd_folders):
+def get_dataset_paths(raw_folder, image_folders):
     image_paths = []
     for image_folder in image_folders:
         folder_path = os.path.join(raw_folder, image_folder)
@@ -51,21 +46,32 @@ def get_dataset_paths(raw_folder, image_folders, pcd_folders):
             if file.lower().endswith(('.png', '.jpg', '.jpeg')):
                 image_path = os.path.join(folder_path, file)
                 image_paths.append(image_path)
-    
-    # Get PCD files
-    pcd_paths = []
-    for pcd_folder in pcd_folders:
-        pcd_folder_path = os.path.join(raw_folder, pcd_folder)
-        if not os.path.exists(pcd_folder_path):
-            print(f"Warning: Folder {pcd_folder_path} does not exist.")
-            continue
-        for file in os.listdir(pcd_folder_path):
-            if file.lower().endswith('.pcd'):
-                pcd_path = os.path.join(pcd_folder_path, file)
-                pcd_paths.append(pcd_path)
-    return image_paths, pcd_paths
+    return image_paths
 
-# 3. Resize Image with Aspect Ratio
+# 3. Segment the fire extinguisher based on color (for better feature extraction)
+def segment_fire_extinguisher(image):
+    # Convert to HSV color space
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # Define color range for red (adjust if necessary)
+    lower_red1 = np.array([0, 50, 50])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 50, 50])
+    upper_red2 = np.array([180, 255, 255])
+
+    # Create masks for red
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    
+    # Combine masks
+    mask = mask1 | mask2
+
+    # Apply the mask to the image
+    segmented_image = cv2.bitwise_and(image, image, mask=mask)
+
+    return segmented_image
+
+# 4. Resize Image with Aspect Ratio
 def resize_image_with_aspect_ratio(image, target_size, inter=cv2.INTER_AREA):
     h, w = image.shape[:2]
     target_width, target_height = target_size
@@ -73,7 +79,7 @@ def resize_image_with_aspect_ratio(image, target_size, inter=cv2.INTER_AREA):
     new_w, new_h = int(w * scale), int(h * scale)
     return cv2.resize(image, (new_w, new_h), interpolation=inter)
 
-# 4. Pad Image to Target Size
+# 5. Pad Image to Target Size
 def pad_image_to_size(image, target_size):
     h, w = image.shape[:2]
     delta_w, delta_h = target_size[0] - w, target_size[1] - h
@@ -82,7 +88,7 @@ def pad_image_to_size(image, target_size):
     color = [0, 0, 0]
     return cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
 
-# 5. Extract Color Histogram (for Image Features)
+# 6. Extract Color Histogram (for Image Features)
 def extract_color_histogram(image, bins=256):
     if len(image.shape) == 2 or image.shape[2] == 1:
         hist = cv2.calcHist([image], [0], None, [bins], [0, 256])
@@ -92,24 +98,27 @@ def extract_color_histogram(image, bins=256):
     cv2.normalize(hist, hist)
     return hist.flatten()
 
-# 6. Extract ORB Features (for Image Features)
+# 7. Extract ORB Features (for Image Features)
 def extract_orb_features(image, max_features=500):
     orb = cv2.ORB_create(nfeatures=max_features)
     keypoints, descriptors = orb.detectAndCompute(image, None)
     return keypoints, descriptors
 
-# 7. Extract Combined Features (ORB + Histogram) for Images
-def extract_features(image_path, target_size=None, max_features=500):
+# 8. Extract Combined Features (ORB + Histogram) for Segmented Images
+def extract_features_from_segmented_image(image_path, target_size=None, max_features=500):
     image = cv2.imread(image_path)
     if image is None:
         print(f"Warning: Unable to load image {image_path}")
         return None, None
 
+    # Segment the fire extinguisher
+    segmented_image = segment_fire_extinguisher(image)
+
     if target_size is not None:
-        resized_image = resize_image_with_aspect_ratio(image, target_size)
+        resized_image = resize_image_with_aspect_ratio(segmented_image, target_size)
         padded_image = pad_image_to_size(resized_image, target_size)
     else:
-        padded_image = image
+        padded_image = segmented_image
 
     gray_image = cv2.cvtColor(padded_image, cv2.COLOR_BGR2GRAY)
     color_hist = extract_color_histogram(padded_image)
@@ -125,38 +134,19 @@ def extract_features(image_path, target_size=None, max_features=500):
     combined_features = np.hstack((color_hist, descriptors))
     return keypoints, combined_features
 
-# 8. Calculate Similarity Score (Image Feature Matching)
+# 9. Calculate Similarity Score (Image Feature Matching)
 def calculate_similarity_score(feature1, feature2):
     return cosine_similarity(feature1.reshape(1, -1), feature2.reshape(1, -1))[0][0]
 
-# 9. Analyze PCD Files and Extract FPFH Features
-def analyze_pcd_files(pcd_paths):
-    pcd_features = []
-    for pcd_path in pcd_paths:
-        try:
-            pcd = o3d.io.read_point_cloud(pcd_path)
-            pcd.estimate_normals()
-            radius_feature = 0.1
-            fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                pcd,
-                o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
-            features = fpfh.data.flatten()
-            pcd_features.append((pcd_path, features))
-        except Exception as e:
-            print(f"Error processing PCD file {pcd_path}: {e}")
-    return pcd_features
-
 # 10. Retrieve Best Matches (Image)
 def retrieve_best_matches(anchor_image_path, dataset_image_paths, target_size, max_features):
-    kp1, features1 = extract_features(anchor_image_path, target_size=target_size, max_features=max_features)
+    kp1, features1 = extract_features_from_segmented_image(anchor_image_path, target_size=target_size, max_features=max_features)
     if features1 is None:
         return []
 
     results = []
     for image_path in dataset_image_paths:
-        if 'camera_color_image_raw' not in image_path:
-            continue
-        kp2, features2 = extract_features(image_path, target_size=target_size, max_features=max_features)
+        kp2, features2 = extract_features_from_segmented_image(image_path, target_size=target_size, max_features=max_features)
         if features2 is None:
             continue
         score = calculate_similarity_score(features1, features2)
@@ -169,10 +159,14 @@ def visualize_matches(anchor_image_path, best_match_image_path, kp1, kp2, target
     img1 = cv2.imread(anchor_image_path)
     img2 = cv2.imread(best_match_image_path)
 
+    # Segment the images before visualization
+    segmented_img1 = segment_fire_extinguisher(img1)
+    segmented_img2 = segment_fire_extinguisher(img2)
+
     # Resize images for better visualization
-    img1_resized = resize_image_with_aspect_ratio(img1, target_size)
+    img1_resized = resize_image_with_aspect_ratio(segmented_img1, target_size)
     img1_padded = pad_image_to_size(img1_resized, target_size)
-    img2_resized = resize_image_with_aspect_ratio(img2, target_size)
+    img2_resized = resize_image_with_aspect_ratio(segmented_img2, target_size)
     img2_padded = pad_image_to_size(img2_resized, target_size)
 
     gray1 = cv2.cvtColor(img1_padded, cv2.COLOR_BGR2GRAY)
@@ -222,14 +216,13 @@ def main():
     raw_folder = "/Users/lianhechu/Documents/Applied AI Master Program/R7020E Computer vision and image processing/Lab/Projects/Project_3/raw/test"
 
     image_folders = ["camera_color_image_raw"]
-    pcd_folders = ["camera_depth_points"]
 
     # Step 1: Convert HEIC to PNG
     convert_heic_to_png(heic_folder=anchor_heic_folder, output_folder=anchor_converted_folder)
 
     # Step 2: Get Anchor Images and Dataset Image Paths
     anchor_images = [os.path.join(anchor_converted_folder, f) for f in os.listdir(anchor_converted_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    dataset_image_paths, pcd_paths = get_dataset_paths(raw_folder, image_folders, pcd_folders)
+    dataset_image_paths = get_dataset_paths(raw_folder, image_folders)
 
     for anchor_image_path in anchor_images:
         print(f"\nProcessing Anchor Image: {anchor_image_path}")
@@ -250,22 +243,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
